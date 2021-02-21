@@ -6,7 +6,7 @@ import (
 	"regexp"
 )
 
-const delimiter string = "function tempInstantAction"
+const delimiter string = "\\/\\* --- temp instant action start --- \\*\\/"
 
 func ioScriptComposer(modules []string) []byte {
 	content := ""
@@ -22,7 +22,7 @@ func ioScriptComposer(modules []string) []byte {
 			continue
 		}
 		defer f.Close()
-		splitter := regexp.MustCompile(delimiter + "\\(\\) {")
+		splitter := regexp.MustCompile(delimiter)
 		scanner := bufio.NewScanner(f)
 		tier := "inject"
 		for scanner.Scan() {
@@ -32,7 +32,7 @@ func ioScriptComposer(modules []string) []byte {
 			} else {
 				if tier == "inject" {
 					partOfInject = partOfInject + text + "\n"
-				} else if text != "}" {
+				} else {
 					partOfAction = partOfAction + text + "\n"
 				}
 			}
@@ -48,7 +48,8 @@ func ioScriptComposer(modules []string) []byte {
 		content = inject + "\n" + content + "\n"
 	}
 	if action != "" {
-		content = content + delimiter + "() {\n" + action + "}"
+		regexp := regexp.MustCompile("[\\\\]")
+		content = content + regexp.ReplaceAllString(delimiter, "") + "\n" + action
 	}
 	return []byte(content)
 }

@@ -11,27 +11,17 @@ const scriptsToCache = [
 
 const helper = {
     delay: 200,
-    delimiter: {
-        action: 'function tempInstantAction()',
-        module: 'function splitByModuleName',
+    delimiters: {
+        action: '/* --- temp instant action start --- */',
+        module: /\/\* --- split modules by name '([1|2|4|8]0*|0)\.js\' --- \*\//g,
+    },
+    errors: {
         notFound: /\/\* --- Module ([1|2|4|8]0*)\.js not found\. --- \*\//g,
-        serverErr: /\/\* --- Error while processing ([1|2|4|8]0*)\.js\. --- \*\//g,
+        serverErr: /\/\* --- Error while processing ([1|2|4|8]0*)\.js\! --- \*\//g,
     },
-    tempContentStore: {},
+    tempModuleStore: {},
     serverErrors: {},
-    setTempContentStoreObject: function(key, obj) {
-        if (!helper.tempContentStore[key]) {
-            helper.tempContentStore[key] = {
-                modules: '',
-                action: '',
-            };
-        }
-        if (obj) {
-            for (var i in obj) {
-                helper.tempContentStore[key][i] = obj[i];
-            }
-        }
-    },
+    fileNotFound: 0,
     filterKeyFromUrl: function(url) {
         var fileName = url.split('/').pop();
         return fileName.replace('reload_', '').split('.')[0];
@@ -64,12 +54,13 @@ const helper = {
         return JSON.stringify(arr);
     },
     moduleDetection: function(key) {
+        var int = parseInt(key.split('.')[0], 16);
+        int &= ~helper.fileNotFound;
         var keys = {
             server: 0,
             client: 0
         };
         var bit = 1;
-        var int = parseInt(key.split('.')[0], 16);
         while (bit < int) {
             if (bit & int) {
                 keys[helper.cacheOrRemote(bit)] |= bit;
@@ -85,6 +76,9 @@ const helper = {
         var bit = 1;
         var int = parseInt(key, 16);
         var moduleCollection = [];
+        if (key === '0') {
+            moduleCollection.push('0.js');
+        }
         while (bit < int) {
             if (bit & int) {
                 moduleCollection.push(bit.toString(16) + '.js');
@@ -93,37 +87,26 @@ const helper = {
         }
         return moduleCollection;
     },
-    composer: function(event, key) {
-        var modules = helper.moduleDetection(key);
-        var fileName = !modules.server && modules.client ? 'reload_' + key : key;
-        var scriptContent = helper.delimiter.action + '{ window.setTimeout(app.plugInLoader.load, ' + helper.delay + ', "js/modules/' + fileName + '.js"); }';
-        var init = !modules.server && !modules.client && !helper.tempContentStore[key];
-        if (init || modules.server || modules.client) {
-            if (helper.tempContentStore[key]) {
-                if (helper.tempContentStore[key].modules !== '') {
-                    if (!helper.tempContentStore[key].counter || helper.tempContentStore[key].counter == helper.tempContentStore[key].children) {
-                        scriptContent = helper.tempContentStore[key].modules + helper.tempContentStore[key].action;
-                        delete helper.tempContentStore[key];
-                    }
-                } else if (modules.client) {
-                    helper.getCachedModulesCollection(key);
-                }
-            } else {
-                var url = 'js/modules/' + modules.server.toString(16).toUpperCase() + '.js';
-                var requestedUrl = 'js/modules/' + event.request.url.split('js/modules/')[1];
-                if (modules.server || init) {
-                    helper.getRemoteModulesCollection(url, requestedUrl);
-                } else {
-                    helper.getCachedModulesCollection(key);
-                }
+    composer: async function(event, key) {
+        var distributedKeys = tempModuleStore.state[key].distributedKeys;
+        if (!tempModuleStore.inited || distributedKeys.server || distributedKeys.client) {
+            if (distributedKeys.server || !tempModuleStore.inited) {
+                tempModuleStore.inited = true;
+                await helper.getRemoteModulesCollection(key);
+                var remoteContentLoaded = true;
             }
-            event.respondWith(
-                new Response(scriptContent, {
-                    headers: {'Content-Type': 'application/javascript'}
-                })
-            );
-        } else {
-            helper.request(event);
+            if (distributedKeys.client) {
+                await helper.getCachedModulesCollection(key);
+                var cachedContentLoaded = true;
+            }
+            if (remoteContentLoaded || cachedContentLoaded) {
+                var scriptContent = 'window.setTimeout(app.plugInLoader.load, ' + helper.delay + ', "js/modules/reload_' + key + '.js");';
+                event.respondWith(
+                    new Response(scriptContent, {
+                        headers: {'Content-Type': 'application/javascript'}
+                    })
+                );
+            }
         }
     },
     request: function(event) {
@@ -152,107 +135,154 @@ const helper = {
             })
         );
     },
-    removeFromCachedModulesKey: function(module) {
-        helper.cachedModulesKey &= ~parseInt(module, 16);
+    removeFromFileNotFoundKey: function(module) {
+        helper.fileNotFound &= ~parseInt(module, 16);
     },
-    serverErrorHandler: function(content) {
-        var matches = content.match(helper.delimiter.serverErr)
+    logger: function(key, msg, err) {
+        var regEx = /(\/?\*\/?| --- )/g;
+        var logLine = 'console.log("' + msg.replace(regEx, '') + '");';
+        if (key) {
+            tempModuleStore.attachContent(key, 'action', logLine);
+        } else {
+            return logLine;
+        }
+    },
+    serverErrorHandler: function(content, key) {
+        var matches = content.match(helper.errors.serverErr)
         for (var i in matches) {
-            content = content.replace(matches[i], '');
-            var module = matches[i].replace(helper.delimiter.serverErr, '$1');
-            helper.cachedModulesKey |= parseInt(module, 16);
-            helper.serverErrors[module] = helper.serverErrors[module] ? helper.serverErrors[module]++ : 1;
-            if (helper.serverErrors[module] <= 3) {
-                self.setTimeout(helper.removeFromCachedModulesKey, 1000, module);
+            helper.logger(key, matches[i]);
+            var module = matches[i].replace(helper.errors.serverErr, '$1');
+            helper.fileNotFound |= parseInt(module, 16);
+            helper.serverErrors[module] = helper.serverErrors[module] ? helper.serverErrors[module] + 1 : 1;
+            if (helper.serverErrors[module] <= 2) {
+                self.setTimeout(helper.removeFromFileNotFoundKey, 1000, module);
             }
         }
-        return content.trim()
     },
-    missingModulesCheck: function(content) {
-        content = helper.serverErrorHandler(content);
-        var matches = content.match(helper.delimiter.notFound)
+    missingModulesCheck: function(content, key) {
+        var matches = content.match(helper.errors.notFound)
         for (var i in matches) {
-            content = content.replace(matches[i], '');
-            var module = matches[i].replace(helper.delimiter.notFound, '$1');
-            helper.cachedModulesKey |= parseInt(module, 16);
+            helper.logger(key, matches[i]);
+            var module = matches[i].replace(helper.errors.notFound, '$1');
+            helper.fileNotFound |= parseInt(module, 16);
         }
-        return content.trim()
     },
-    getRemoteModulesCollection: function(url, requestedUrl) {
-        fetch(url)
+    getRemoteModulesCollection: async function(key) {
+        fetch(tempModuleStore.state[key].urls.remote)
         .then(response => {
             if (response.ok) {
                 response.text()
-                .then(text => {
-                    caches.open(staticModuleCacheName)
-                    .then(cache => {
-                        var splitedCode = text.split(helper.delimiter.action);
-                        splitedCode[0] = helper.missingModulesCheck(splitedCode[0]);
-                        if (splitedCode[0].match(helper.delimiter.module)) {
-                            var moduleChunks = splitedCode[0].split(helper.delimiter.module);
-                            for (var i in moduleChunks) {
-                                if (moduleChunks[i].trim() == '') {
-                                    continue;
-                                }
-                                var moduleChunk = moduleChunks[i];
-                                var fileName = moduleChunk.match(/^\(['|"]?[^'|"|\)]*/)[0].replace(/^\(['|"]?/,'');
-                                var moduleContent = helper.delimiter.module + moduleChunk;
-                                helper.cachedModulesKey |= parseInt(fileName, 16);
-                                cache.put('js/modules/' + fileName + '.js', 
-                                    new Response(moduleContent, {
-                                        headers: {'Content-Type': 'application/javascript'}
-                                    })
-                                );
-                                helper.cachedModulesKey |= parseInt(fileName, 16);
-                            }
-                        }
-                        if (splitedCode[1]) {
-                            var key = helper.filterKeyFromUrl(requestedUrl);
-                            helper.setTempContentStoreObject(key, {
-                                action: helper.delimiter.action + splitedCode[1],
-                            });
-                        }
-                    })
-                }).catch(() => {
-                    return caches.match(failed);
+                .then(async text => {
+                    tempModuleStore.handleRemoteResponse(key, text);
                 });
-            } else {
-                return response;
             }
-        }).catch(() => {
-            return caches.match(failed);
         })
     },
     getCachedModulesCollection: function(key) {
-        var moduleCollection = helper.getModuleCollectionFromKey(key);
         caches.open(staticModuleCacheName)
-        .then(cache => {
+        .then(async cache => {
+            var moduleCollection = tempModuleStore.state[key].modules;
             for (var i in moduleCollection) {
                 cache.match('js/modules/' + moduleCollection[i])
                 .then(response => {
                     if (typeof response !== 'undefined' && response.ok) {
                         response.text()
                         .then(text => {
-                            if (helper.tempContentStore[key]) {
-                                helper.tempContentStore[key].modules += text+'\n';
-                                if (helper.tempContentStore[key].counter) {
-                                    helper.tempContentStore[key].counter += 1;
-                                }
-                            } else {
-                                helper.setTempContentStoreObject(key, {
-                                    modules: text+'\n',
-                                    action: helper.delimiter.action + '{ console.log("Pure local response!"); }',
-                                    counter: 1,
-                                    children: moduleCollection.length,
-                                });
-                            }
+                            var splitedCode = text.split(helper.delimiters.action);
+                            tempModuleStore.attachContent(key, 'modules', splitedCode[0]);
+                            tempModuleStore.attachContent(key, 'action', splitedCode[1]);
                         })
                     }
                 });
             }
-        })
+        });
     },
 };
+
+const tempModuleStore = {
+    state: {},
+    // settempModuleStoreObject
+    initiateOrComplete: function(event) {
+        var key = helper.filterKeyFromUrl(event.request.url);
+        if (!tempModuleStore.state[key]) { 
+            var distributedKeys = helper.moduleDetection(key);
+            var obj = {
+                content : {
+                    modules: '',
+                    action: '',
+                },
+                urls: {
+                    remote: 'js/modules/' + distributedKeys.server.toString(16).toUpperCase() + '.js',
+                    cache: 'js/modules/' + event.request.url.split('js/modules/')[1],
+                },
+                distributedKeys: distributedKeys,
+                modules: helper.getModuleCollectionFromKey(key),
+            };
+            tempModuleStore.state[key] = obj
+            return key;
+        } else if (event.request.url.indexOf('reload_' + key) != -1) {
+            var scriptContent = tempModuleStore.getScriptContent(key);
+            event.respondWith(
+                new Response(scriptContent, {
+                    headers: {'Content-Type': 'application/javascript'}
+                })
+            );
+        }
+    },
+    handleRemoteResponse: async function(key, text) {
+        await caches.open(staticModuleCacheName)
+        .then(async cache => {
+            var splitedCode = text.split(helper.delimiters.action);
+            helper.missingModulesCheck(splitedCode[0], key);
+            helper.serverErrorHandler(splitedCode[0], key);
+            if (splitedCode[0].match(helper.delimiters.module)) {
+                var moduleChunks = splitedCode[0].split(helper.delimiters.module);
+                var i = 1;
+                while (moduleChunks[i]) {
+                    var moduleKey = moduleChunks[i++];
+                    if (String(Number(moduleKey)) === moduleKey) {
+                        var content = moduleChunks[i++].replace(helper.errors.notFound, '').replace(helper.errors.serverErr, '').trim();
+                        tempModuleStore.attachContent(key, 'modules', content)
+                        if (content != '') {
+                            await cache.put('js/modules/' + moduleKey + '.js', 
+                                new Response(content, {
+                                    headers: {'Content-Type': 'application/javascript'}
+                                })
+                            );
+                            helper.cachedModulesKey |= parseInt(moduleKey, 16);
+                        }
+                    }
+                }
+            }
+            if (splitedCode[1]) {
+                tempModuleStore.attachContent(key, 'action', splitedCode[1]);
+            }
+            if (key === "0") {
+                helper.logger(key, 'Base module installed!');
+            }
+        })
+    },
+    attachContent: function(key, type, content) {
+        if (content && content.trim() !== "") {
+            if (tempModuleStore.state[key].content[type]) {
+                tempModuleStore.state[key].content[type] += '\n' + content;
+            } else {
+                tempModuleStore.state[key].content[type] = content;
+            }
+        }
+    },
+    getScriptContent: function(key) {
+        tempModule = tempModuleStore.state[key];
+        delete tempModuleStore.state[key];
+        if (tempModule.content.modules + tempModule.content.action  === '') {
+            return helper.logger(false, 'No modules get collected!');
+        }
+        if (tempModule.content.modules  !== '' && tempModule.content.action  === '' && tempModule.distributedKeys.server == 0) {
+            tempModule.content.action += '\n' + helper.logger(false, 'Pure local response!');
+        }
+        return tempModule.content.modules + '\n\n' + helper.delimiters.action + '\n' + tempModule.content.action;
+    },
+}
 
 self.addEventListener('install', event => {
     self.skipWaiting();
@@ -272,10 +302,12 @@ self.addEventListener('fetch', event => {
         helper.request(event);
     }
     if (event.request.url.match(/\/(modules|plugins)\/.*\.js$/)) {
-        var key = helper.filterKeyFromUrl(event.request.url);
         if (!helper.cachedModulesKey) {
             helper.setCachedModulesKey();
         }
-        helper.composer(event, key);
+        var key = tempModuleStore.initiateOrComplete(event);
+        if (key) {
+            helper.composer(event, key)
+        }
     }
 });
